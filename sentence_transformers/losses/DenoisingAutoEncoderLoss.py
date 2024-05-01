@@ -3,6 +3,8 @@ from typing import Iterable, Dict
 from sentence_transformers import SentenceTransformer
 from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM, PreTrainedModel
 import logging
+import wandb
+import torch
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +70,8 @@ class DenoisingAutoEncoderLoss(nn.Module):
         super(DenoisingAutoEncoderLoss, self).__init__()
         self.encoder = model  # This will be the final model used during the inference time.
         self.tokenizer_encoder = model.tokenizer
+
+        self.iter = 0
 
         encoder_name_or_path = model[0].auto_model.config._name_or_path
         if decoder_name_or_path is None:
@@ -157,4 +161,25 @@ class DenoisingAutoEncoderLoss(nn.Module):
         lm_logits = decoder_outputs[0]
         ce_loss_fct = nn.CrossEntropyLoss(ignore_index=self.tokenizer_decoder.pad_token_id)
         loss = ce_loss_fct(lm_logits.view(-1, lm_logits.shape[-1]), label_ids.reshape(-1))
+
+        if self.iter % 100 == 0:
+            tok_ids = lm_logits.argmax(-1)
+            n_correct = (tok_ids.reshape(-1) == label_ids.reshape(-1)).sum()
+            acc = (n_correct / tok_ids.nelement()).item()
+            logger.info(f'iter {self.iter} accuracy {acc}')
+
+            src_sents = self.tokenizer_encoder.batch_decode(source_features['input_ids'])
+            rec_sents = self.tokenizer_encoder.batch_decode(tok_ids)
+
+            wandb.log({
+                'accuracy': acc,
+                'loss': loss,
+                'examples': wandb.Table(
+                    columns=['id', 'original', 'teacher reconstruction'],
+                    data=list(zip(range(len(src_sents)), src_sents, rec_sents)),
+                ),
+            })
+
+        self.iter += 1
+
         return loss
