@@ -138,6 +138,10 @@ class DenoisingAutoEncoderLoss(nn.Module):
             # since the sentence_features here are all tokenized by encoder's tokenizer,
             # retokenization by the decoder's one is needed if different tokenizers used
             target_features = self.retokenize(target_features)
+        # print('sf', source_features)
+        # self.encoder.eval()
+        # self.decoder.eval()
+        # print(self.encoder.training, self.decoder.training)
         reps = self.encoder(source_features)["sentence_embedding"]  # (bsz, hdim)
 
         # Prepare input and output
@@ -145,6 +149,12 @@ class DenoisingAutoEncoderLoss(nn.Module):
         decoder_input_ids = target_features["input_ids"].clone()[:, : target_length - 1]
         label_ids = target_features["input_ids"][:, 1:]
 
+        # k = 3
+        # # print(target_features)
+        # print('dec ids', decoder_input_ids[...,:k])
+        # # print(label_ids)
+        # print('reps', reps[:, None])
+        # # import pdb; pdb.set_trace()
         # Decode
         decoder_outputs = self.decoder(
             input_ids=decoder_input_ids,
@@ -159,17 +169,23 @@ class DenoisingAutoEncoderLoss(nn.Module):
 
         # Calculate loss
         lm_logits = decoder_outputs[0]
+        # print(lm_logits.argmax(-1))
         ce_loss_fct = nn.CrossEntropyLoss(ignore_index=self.tokenizer_decoder.pad_token_id)
         loss = ce_loss_fct(lm_logits.view(-1, lm_logits.shape[-1]), label_ids.reshape(-1))
 
-        if self.iter % 100 == 0:
+        if self.iter % 200 == 0:
             tok_ids = lm_logits.argmax(-1)
-            n_correct = (tok_ids.reshape(-1) == label_ids.reshape(-1)).sum()
-            acc = (n_correct / tok_ids.nelement()).item()
+            n_non_pad = tok_ids != self.tokenizer_decoder.pad_token_id
+            n_correct = n_non_pad * (tok_ids == label_ids)
+            acc = (n_correct.sum() / n_non_pad.sum()).item()
             logger.info(f'iter {self.iter} accuracy {acc}')
 
             src_sents = self.tokenizer_encoder.batch_decode(source_features['input_ids'])
             rec_sents = self.tokenizer_encoder.batch_decode(tok_ids)
+            # print('ORIG:', src_sents)
+            # print('REC:', rec_sents)
+            # for i, sent in enumerate(rec_sents):
+            #     print(i, sent)
 
             wandb.log({
                 'accuracy': acc,
