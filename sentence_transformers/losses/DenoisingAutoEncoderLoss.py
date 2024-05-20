@@ -10,7 +10,7 @@ logger = logging.getLogger(__name__)
 
 
 class DenoisingAutoEncoderLoss(nn.Module):
-    def __init__(self, model: SentenceTransformer, decoder_name_or_path: str = None, tie_encoder_decoder: bool = True):
+    def __init__(self, model: SentenceTransformer, decoder_name_or_path: str = None, tie_encoder_decoder: bool = True, loss_fn: str = 'vanilla'):
         """
         This loss expects as input a pairs of damaged sentences and the corresponding original ones.
         During training, the decoder reconstructs the original sentences from the encoded sentence embeddings.
@@ -121,6 +121,8 @@ class DenoisingAutoEncoderLoss(nn.Module):
                 model[0].auto_model, self.decoder._modules[decoder_base_model_prefix], self.decoder.base_model_prefix
             )
 
+        self.loss_fn = loss_fn
+
     def retokenize(self, sentence_features):
         input_ids = sentence_features["input_ids"]
         device = input_ids.device
@@ -169,15 +171,34 @@ class DenoisingAutoEncoderLoss(nn.Module):
 
         # Calculate loss
         lm_logits = decoder_outputs[0]
-        # print(lm_logits.argmax(-1))
-        ce_loss_fct = nn.CrossEntropyLoss(ignore_index=self.tokenizer_decoder.pad_token_id)
-        loss = ce_loss_fct(lm_logits.view(-1, lm_logits.shape[-1]), label_ids.reshape(-1))
+        ce_loss_fct = nn.CrossEntropyLoss(ignore_index=self.tokenizer_decoder.pad_token_id, reduction='none')
+        non_pad = label_ids != self.tokenizer_decoder.pad_token_id
+        loss = ce_loss_fct(lm_logits.permute(0, 2, 1), label_ids)
+        # loss = ce_loss_fct(lm_logits.view(-1, lm_logits.shape[-1]), label_ids.reshape(-1))
+        if self.loss_fn == 'vanilla':
+            loss = (loss * non_pad).sum() / non_pad.sum()
+        elif self.loss_fn == 'john':
+            # John's suggestion:
+            # loss_i = sum_{k=i}^n softmax(e_1,...e_k)_i e_i
+            coef = torch.zeros_like(label_ids, dtype=torch.float32)
+            for t in range(label_ids.size(1)):
+                cum_softmax = nn.functional.softmax(loss[:, :t+1], 1)
+                # print(cum_softmax)
+                # print(t, non_pad[:, [t]])
+                coef[:, :t+1] += cum_softmax * non_pad[:, [t]]
+                # cum_softmaxs.append(cum_softmax * non_pad[:, t])
+                # print(cum_softmaxs[-1)]
+            loss = (coef.detach() * loss * non_pad).sum() / non_pad.sum()
+        elif self.loss_fn == 'linear':
+            steps_to_go = non_pad.flip(1).cumsum(-1).flip(1)
+            loss = (steps_to_go * loss * non_pad).sum() / non_pad.sum()
+        else:
+            assert False, f'{self.loss_fn} is not a recognized loss function.'
 
         if self.iter % 200 == 0:
             tok_ids = lm_logits.argmax(-1)
-            n_non_pad = tok_ids != self.tokenizer_decoder.pad_token_id
-            n_correct = n_non_pad * (tok_ids == label_ids)
-            acc = (n_correct.sum() / n_non_pad.sum()).item()
+            is_correct = non_pad * (tok_ids == label_ids)
+            acc = (is_correct.sum() / non_pad.sum()).item()
             logger.info(f'iter {self.iter} accuracy {acc}')
 
             src_sents = self.tokenizer_encoder.batch_decode(source_features['input_ids'])
@@ -190,6 +211,7 @@ class DenoisingAutoEncoderLoss(nn.Module):
             wandb.log({
                 'accuracy': acc,
                 'loss': loss,
+                # 'per_token_loss': loss / n_non_pad,
                 'examples': wandb.Table(
                     columns=['id', 'original', 'teacher reconstruction'],
                     data=list(zip(range(len(src_sents)), src_sents, rec_sents)),
